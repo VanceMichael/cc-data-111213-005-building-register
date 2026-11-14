@@ -1,29 +1,52 @@
 import { readFile } from 'node:fs/promises';
+import { parseStep, encodeValue } from './step.js';
+import { loadIfcModel } from './ifc.js';
+
 export const sample = 'fixtures/plant.ifc';
-export function splitStepArguments(text) {
-  const result = [];
-  let start = 0, depth = 0, quoted = false;
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index];
-    if (char === "'") {
-      if (quoted && text[index + 1] === "'") { index += 1; continue; }
-      quoted = !quoted;
-    }
-    if (quoted) continue;
-    if (char === '(') depth += 1;
-    if (char === ')') depth -= 1;
-    if (char === ',' && depth === 0) { result.push(text.slice(start, index).trim()); start = index + 1; }
-  }
-  if (quoted || depth !== 0) throw new Error('STEP 参数未闭合');
-  result.push(text.slice(start).trim());
-  return result;
-}
+export { splitStepArguments } from './step.js';
+
+// Existing view: schema and STEP entities with their raw argument text.  The
+// STEP location of every line is added so callers can point at the original
+// file without re-parsing it.
 export async function inspect(filename) {
   const text = await readFile(filename, 'utf8');
-  if (!text.startsWith('ISO-10303-21;')) throw new Error('不是 STEP 交换文件');
-  const entities = [];
-  for (const match of text.matchAll(/#(\d+)\s*=\s*(IFC\w+)\(([^;]*)\);/g)) {
-    entities.push({ id: Number(match[1]), type: match[2], arguments: splitStepArguments(match[3]) });
-  }
-  return { schema: /FILE_SCHEMA\(\(.'?(IFC\w+)/.exec(text)?.[1] || 'IFC4', entities };
+  const parsed = parseStep(text);
+  return {
+    schema: parsed.schema,
+    entities: parsed.entities.map(entity => ({
+      id: entity.id,
+      type: entity.type,
+      stepLine: entity.stepLine,
+      arguments: entity.arguments,
+    })),
+    issues: parsed.issues,
+  };
+}
+
+// Look up one STEP entity together with the entities that reference it and
+// the ones it references.  This keeps a large model out of the caller's
+// context: only the neighbourhood is returned.
+export async function entityView(filename, stepId) {
+  const model = loadIfcModel(await readFile(filename, 'utf8'));
+  const entity = model.byId.get(stepId);
+  if (!entity) throw new Error(`STEP 实体 #${stepId} 不存在`);
+  return {
+    entity: {
+      stepId: entity.id,
+      ifcType: entity.type,
+      stepLine: entity.stepLine,
+      arguments: entity.arguments,
+      values: entity.values.map(encodeValue),
+    },
+    referencedBy: (model.reverse.get(stepId) ?? []).map((id) => {
+      const referrer = model.byId.get(id);
+      return { stepId: id, ifcType: referrer.type, stepLine: referrer.stepLine };
+    }),
+    references: (model.forward.get(stepId) ?? []).map((id) => {
+      const target = model.byId.get(id);
+      return target
+        ? { stepId: id, ifcType: target.type, stepLine: target.stepLine }
+        : { stepId: id, ifcType: null, stepLine: null, missing: true };
+    }),
+  };
 }
